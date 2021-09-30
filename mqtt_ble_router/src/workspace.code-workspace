@@ -1,0 +1,9 @@
+{
+	"folders": [
+		{
+			"name": "mqtt_ble_router",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
