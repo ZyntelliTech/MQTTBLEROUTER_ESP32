@@ -1,3 +1,21 @@
+#define SERVICE_UUID "80f20f81-82af-4df8-9bf0-520f4997cca6"
+#define CONFIGURE_UUID "80f20f82-82af-4df8-9bf0-520f4997cca6"
+#define MQTT_UUID "80f20f83-82af-4df8-9bf0-520f4997cca6"
+#define EEPROM_SIZE 1
+
+#define BUFFER_SIZE 256
+#define WIFI_SSID_CMD 0x01
+#define WIFI_PASSWD_CMD 0x02
+#define DEV_NAME_CMD 0x03
+#define DEV_ID_CMD 0x04
+#define DEV_PATH_CMD 0x05
+#define MQTT_SERVER_CMD 0x06
+#define MQTT_PORT_CMD 0x07
+#define MQTT_PUB_CMD 0x08
+#define MQTT_SUB_CMD 0x09
+
+#define BUTTON_PIN_BITMASK 0x200000000 // 2^33 in hex
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -14,21 +32,25 @@
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <ESPAsyncWebServer.h>
+#include <EEPROM.h>
 
-#define SERVICE_UUID "80f20f81-82af-4df8-9bf0-520f4997cca6"
-#define CONFIGURE_UUID "80f20f82-82af-4df8-9bf0-520f4997cca6"
-#define MQTT_UUID "80f20f83-82af-4df8-9bf0-520f4997cca6"
+const int config_button = 15;
+const int sleep_button = 2;
+const int LONG_PRESS_TIME = 2000;
+uint8_t  config_mode = 0;
 
-#define BUFFER_SIZE 256
-#define WIFI_SSID_CMD 0x01
-#define WIFI_PASSWD_CMD 0x02
-#define DEV_NAME_CMD 0x03
-#define DEV_ID_CMD 0x04
-#define DEV_PATH_CMD 0x05
-#define MQTT_SERVER_CMD 0x06
-#define MQTT_PORT_CMD 0x07
-#define MQTT_PUB_CMD 0x08
-#define MQTT_SUB_CMD 0x09
+
+// Variables will change:
+int lastState = LOW;  // the previous state from the input pin
+int currentState;     // the current reading from the input pin
+unsigned long pressedTime  = 0;
+unsigned long releasedTime = 0;
+
+// Variables for deep sleep
+int lastState_dp = LOW;  // the previous state from the input pin
+int currentState_dp;     // the current reading from the input pin
+unsigned long pressedTime_dp  = 0;
+unsigned long releasedTime_dp = 0;
 
 WebServer server(80);
 
@@ -141,6 +163,22 @@ uint8_t setup_wifi();
 void setup_ble();
 void storeConfig();
 void setup_webserver();
+
+//Function that prints the reason by which ESP32 has been awaken from sleep
+void print_wakeup_reason(){
+  esp_sleep_wakeup_cause_t wakeup_reason;
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch(wakeup_reason)
+  {
+    case 1  : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case 2  : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case 3  : Serial.println("Wakeup caused by timer"); break;
+    case 4  : Serial.println("Wakeup caused by touchpad"); break;
+    case 5  : Serial.println("Wakeup caused by ULP program"); break;
+    default : Serial.println("Wakeup was not caused by deep sleep"); break;
+  }
+}
+
 class MyServerCallbacks : public BLEServerCallbacks
 {
   void onConnect(BLEServer *pServer)
@@ -428,29 +466,34 @@ uint8_t setup_wifi()
 
 void setup_ble()
 {
+  Serial.println("init the BLE...");
   BLEDevice::init("MyESP32");
   pServer = BLEDevice::createServer();
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
   pServer->setCallbacks(new MyServerCallbacks());
 
-  pCharacteristic_conf = pService->createCharacteristic(
+  if(config_mode == 1){
+    pCharacteristic_conf = pService->createCharacteristic(
       CONFIGURE_UUID,
       BLECharacteristic::PROPERTY_READ |
-          BLECharacteristic::PROPERTY_WRITE);
-  pCharacteristic_conf->setCallbacks(new MyCallbacksForConfig());
-  pCharacteristic_conf->setValue("configuration");
-
-  pCharacteristic_mqtt = pService->createCharacteristic(
+      BLECharacteristic::PROPERTY_WRITE
+    );
+    pCharacteristic_conf->setCallbacks(new MyCallbacksForConfig());
+    pCharacteristic_conf->setValue("configuration");
+  }
+  else{
+    pCharacteristic_mqtt = pService->createCharacteristic(
       MQTT_UUID,
       BLECharacteristic::PROPERTY_READ |
-          BLECharacteristic::PROPERTY_WRITE |
-          BLECharacteristic::PROPERTY_NOTIFY |
-          BLECharacteristic::PROPERTY_INDICATE);
-  pCharacteristic_mqtt->addDescriptor(new BLE2902());
-  pCharacteristic_mqtt->setCallbacks(new MyCallbacksForMqtt());
-  pCharacteristic_mqtt->setValue("mqtt_router");
-
+      BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_NOTIFY |
+      BLECharacteristic::PROPERTY_INDICATE
+    );
+    pCharacteristic_mqtt->addDescriptor(new BLE2902());
+    pCharacteristic_mqtt->setCallbacks(new MyCallbacksForMqtt());
+    pCharacteristic_mqtt->setValue("mqtt_router");
+  }
   pService->start();
 
   BLEAdvertising *pAdvertising = pServer->getAdvertising();
@@ -478,6 +521,7 @@ void callback(char *topic, byte *message, unsigned int length)
 /**** mqtt reconnect function ****/
 boolean reconnect()
 {
+  //client.setSocketTimeout(5);
   if (client.connect(dev_id))
   {
     Serial.println("mqtt connecting...");
@@ -694,12 +738,71 @@ void setup()
 {
   // put your setup code here, to run once:
   Serial.begin(9600);
+  //Init EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  config_mode = EEPROM.read(0);
+  Serial.printf("Config Mode: %d\n", config_mode);
+  pinMode(config_button, INPUT_PULLUP);
+  pinMode(33, INPUT_PULLUP);
+  
+  //Reveille le processeur en appuyant sur un bouton connecte au GPIO34
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_33,0);
+
   setupSpiffs();
   setup_ble();
 }
 ///*********************************************** Main loop **************************************///
 void loop()
 {
+  // read the state of the switch/button:
+   //Print the wakeup reason for ESP32
+  //print_wakeup_reason();
+  currentState = digitalRead(config_button);
+  Serial.printf("config pin status: %d\n", currentState);
+  if(lastState == HIGH && currentState == LOW)        // button is pressed
+  {
+    Serial.println("Config Button is pressed");
+    pressedTime = millis();
+  }
+  else if(lastState == LOW && currentState == HIGH) { // button is released
+    Serial.println("Config Button is released");
+    releasedTime = millis();
+    long pressDuration = abs(releasedTime - pressedTime);
+
+    if( pressDuration > LONG_PRESS_TIME ){
+      Serial.println("A long press is detected");
+      if(config_mode == 0){ config_mode = 1; }
+      else{ config_mode = 0; }
+      EEPROM.write(0, config_mode);
+      EEPROM.commit();
+      ESP.restart();
+    }
+  }
+   // save the the last state
+  lastState = currentState;
+
+  // deep sleep / wake up
+  currentState_dp = digitalRead(33);
+  Serial.printf("sleep pin status: %d\n", currentState_dp);
+  if(lastState_dp == HIGH && currentState_dp == LOW)        // button is pressed
+  {
+   Serial.println("Sleep Button is pressed");
+    pressedTime_dp = millis();
+    
+  }
+  if(lastState_dp == LOW && currentState_dp == HIGH) { // button is released
+    Serial.println("Sleep Button is released");
+    releasedTime_dp = millis();
+    long pressDuration_dp = abs(releasedTime_dp - pressedTime_dp);   
+    if( pressDuration_dp > 3000 ){
+      Serial.println("A long press is detected");
+      //Go to sleep now
+      esp_deep_sleep_start();
+    }
+  }
+  // save the the last state
+  lastState_dp = currentState_dp;
+
   if (!bleConnected)
   { //check the BLE connection. if not, the mcu start advertising.
     pServer->startAdvertising();
@@ -714,41 +817,44 @@ void loop()
   {
     server.handleClient();
   }
-  if (!mqttconfigured)
-  { //setup mqtt server and port. if not, check the mqtt and device info and try the mqtt connection
-    checkmqttinfo();
-    delay(500);
-  }
-  if (wificonnected && mqttconfigured)
-  { //check the mqtt status if disconnected, try to reconnect, if not, run the subscribe
-    if (!client.connected())
-    {
-      long now = millis();
-      if (now - lastReconnectAttempt > 2000)
+  if(config_mode == 0){
+    if (!mqttconfigured)
+    { //setup mqtt server and port. if not, check the mqtt and device info and try the mqtt connection
+      checkmqttinfo();
+      delay(500);
+    }
+
+    if (wificonnected && mqttconfigured)
+    { //check the mqtt status if disconnected, try to reconnect, if not, run the subscribe
+      if (!client.connected())
       {
-        lastReconnectAttempt = now;
-        // Attempt to reconnect
-        Serial.println("Attempt to connect");
-        if (reconnect())
+        long now = millis();
+        if (now - lastReconnectAttempt > 2000)
         {
-          lastReconnectAttempt = 0;
+          lastReconnectAttempt = now;
+          // Attempt to reconnect
+          Serial.println("Attempt to connect");
+          if (reconnect())
+          {
+            lastReconnectAttempt = 0;
+          }
         }
       }
-    }
-    else
-    {
-      client.loop();
-      if (receivefromble)
+      else
       {
-        Serial.println("Buffer Data:");
-        HexDump(Serial, buf, BUFFER_SIZE);
-        String real_pub;
-        real_pub = String(dev_id) + "/" + String(dev_path) + "/" + String(mqtt_pub);
-        client.publish(real_pub.c_str(), buf, buf_len);
-        //reset the buffer
-        receivefromble = false;
-        buf_len = 0;
-        memset(buf, '\0', BUFFER_SIZE);
+        client.loop();
+        if (receivefromble)
+        {
+          Serial.println("Buffer Data:");
+          HexDump(Serial, buf, BUFFER_SIZE);
+          String real_pub;
+          real_pub = String(dev_id) + "/" + String(dev_path) + "/" + String(mqtt_pub);
+          client.publish(real_pub.c_str(), buf, buf_len);
+          //reset the buffer
+          receivefromble = false;
+          buf_len = 0;
+          memset(buf, '\0', BUFFER_SIZE);
+        }
       }
     }
   }
